@@ -6,11 +6,23 @@
 (define-constant ERR_INVALID_AMOUNT (err u104))
 (define-constant ERR_NO_DIVIDENDS (err u105))
 (define-constant ERR_TRANSFER_FAILED (err u106))
+(define-constant ERR_LOAN_NOT_FOUND (err u107))
+(define-constant ERR_LOAN_ALREADY_EXISTS (err u108))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u109))
+(define-constant ERR_LOAN_NOT_APPROVED (err u110))
+(define-constant ERR_LOAN_ALREADY_APPROVED (err u111))
+(define-constant ERR_INVALID_LOAN_TERMS (err u112))
+(define-constant ERR_LOAN_OVERDUE (err u113))
+(define-constant ERR_PAYMENT_TOO_LOW (err u114))
 
 (define-data-var total-pool uint u0)
 (define-data-var dividend-rate uint u500)
 (define-data-var last-dividend-block uint u0)
 (define-data-var total-members uint u0)
+(define-data-var next-loan-id uint u1)
+(define-data-var total-loans-issued uint u0)
+(define-data-var total-active-loans uint u0)
+(define-data-var loan-interest-rate uint u800)
 
 (define-map members principal {
     contribution: uint,
@@ -22,6 +34,28 @@
 (define-map member-dividends principal uint)
 
 (define-map contribution-history {member: principal, block: uint} uint)
+
+(define-map loans uint {
+    borrower: principal,
+    amount: uint,
+    interest-rate: uint,
+    term-blocks: uint,
+    issued-block: uint,
+    repaid-amount: uint,
+    is-approved: bool,
+    is-active: bool,
+    is-defaulted: bool
+})
+
+(define-map loan-applications principal {
+    requested-amount: uint,
+    term-blocks: uint,
+    collateral-contribution: uint,
+    application-block: uint,
+    status: (string-ascii 20)
+})
+
+(define-map borrower-loans principal (list 10 uint))
 
 (define-public (join-credit-union (initial-contribution uint))
     (let (
@@ -225,5 +259,266 @@
             none
         ))
         none
+    )
+)
+
+(define-public (apply-for-loan (requested-amount uint) (term-blocks uint))
+    (let (
+        (sender tx-sender)
+        (member-data (unwrap! (map-get? members sender) ERR_MEMBER_NOT_FOUND))
+        (existing-application (map-get? loan-applications sender))
+    )
+    (asserts! (is-none existing-application) ERR_LOAN_ALREADY_EXISTS)
+    (asserts! (> requested-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> term-blocks u0) ERR_INVALID_LOAN_TERMS)
+    (asserts! (get is-active member-data) ERR_NOT_AUTHORIZED)
+    (asserts! (<= term-blocks u52560) ERR_INVALID_LOAN_TERMS)
+    
+    (let (
+        (member-contribution (get contribution member-data))
+        (max-loan-amount (/ (* member-contribution u300) u100))
+    )
+    (asserts! (<= requested-amount max-loan-amount) ERR_INSUFFICIENT_COLLATERAL)
+    
+    (map-set loan-applications sender {
+        requested-amount: requested-amount,
+        term-blocks: term-blocks,
+        collateral-contribution: member-contribution,
+        application-block: stacks-block-height,
+        status: "pending"
+    })
+    
+    (ok true)
+    )
+    )
+)
+
+(define-public (approve-loan (borrower principal))
+    (let (
+        (application-data (unwrap! (map-get? loan-applications borrower) ERR_LOAN_NOT_FOUND))
+        (member-data (unwrap! (map-get? members borrower) ERR_MEMBER_NOT_FOUND))
+        (loan-id (var-get next-loan-id))
+        (requested-amount (get requested-amount application-data))
+        (term-blocks (get term-blocks application-data))
+        (current-rate (var-get loan-interest-rate))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status application-data) "pending") ERR_LOAN_ALREADY_APPROVED)
+    (asserts! (>= (stx-get-balance (as-contract tx-sender)) requested-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (as-contract (stx-transfer? requested-amount tx-sender borrower)))
+    
+    (map-set loans loan-id {
+        borrower: borrower,
+        amount: requested-amount,
+        interest-rate: current-rate,
+        term-blocks: term-blocks,
+        issued-block: stacks-block-height,
+        repaid-amount: u0,
+        is-approved: true,
+        is-active: true,
+        is-defaulted: false
+    })
+    
+    (map-set loan-applications borrower (merge application-data {
+        status: "approved"
+    }))
+    
+    (let (
+        (current-loans (default-to (list) (map-get? borrower-loans borrower)))
+    )
+    (map-set borrower-loans borrower (unwrap! (as-max-len? (append current-loans loan-id) u10) ERR_INVALID_LOAN_TERMS))
+    )
+    
+    (var-set next-loan-id (+ loan-id u1))
+    (var-set total-loans-issued (+ (var-get total-loans-issued) u1))
+    (var-set total-active-loans (+ (var-get total-active-loans) u1))
+    
+    (ok loan-id)
+    )
+)
+
+(define-public (repay-loan (loan-id uint) (payment-amount uint))
+    (let (
+        (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+        (sender tx-sender)
+        (borrower (get borrower loan-data))
+        (total-owed (calculate-total-owed loan-id))
+    )
+    (asserts! (is-eq sender borrower) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active loan-data) ERR_LOAN_NOT_APPROVED)
+    (asserts! (> payment-amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? payment-amount sender (as-contract tx-sender)))
+    
+    (let (
+        (new-repaid-amount (+ (get repaid-amount loan-data) payment-amount))
+        (is-fully-repaid (>= new-repaid-amount total-owed))
+    )
+    
+    (map-set loans loan-id (merge loan-data {
+        repaid-amount: new-repaid-amount,
+        is-active: (not is-fully-repaid)
+    }))
+    
+    (if is-fully-repaid
+        (begin
+            (var-set total-active-loans (- (var-get total-active-loans) u1))
+            (ok "loan-completed")
+        )
+        (ok "payment-received")
+    )
+    )
+    )
+)
+
+(define-private (calculate-total-owed (loan-id uint))
+    (let (
+        (loan-data (unwrap-panic (map-get? loans loan-id)))
+        (principal-amount (get amount loan-data))
+        (interest-rate (get interest-rate loan-data))
+        (term-blocks (get term-blocks loan-data))
+        (issued-block (get issued-block loan-data))
+        (blocks-elapsed (- stacks-block-height issued-block))
+    )
+    (let (
+        (interest-accrued (/ (* (* principal-amount interest-rate) blocks-elapsed) (* u10000 term-blocks)))
+    )
+    (+ principal-amount interest-accrued)
+    )
+    )
+)
+
+(define-public (mark-loan-default (loan-id uint))
+    (let (
+        (loan-data (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+        (borrower (get borrower loan-data))
+        (issued-block (get issued-block loan-data))
+        (term-blocks (get term-blocks loan-data))
+        (due-block (+ issued-block term-blocks))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active loan-data) ERR_LOAN_NOT_APPROVED)
+    (asserts! (> stacks-block-height due-block) ERR_INVALID_LOAN_TERMS)
+    
+    (map-set loans loan-id (merge loan-data {
+        is-defaulted: true,
+        is-active: false
+    }))
+    
+    (let (
+        (member-data (unwrap! (map-get? members borrower) ERR_MEMBER_NOT_FOUND))
+    )
+    (map-set members borrower (merge member-data {
+        is-active: false
+    }))
+    )
+    
+    (var-set total-active-loans (- (var-get total-active-loans) u1))
+    
+    (ok true)
+    )
+)
+
+(define-public (reject-loan (borrower principal))
+    (let (
+        (application-data (unwrap! (map-get? loan-applications borrower) ERR_LOAN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status application-data) "pending") ERR_LOAN_ALREADY_APPROVED)
+    
+    (map-set loan-applications borrower (merge application-data {
+        status: "rejected"
+    }))
+    
+    (ok true)
+    )
+)
+
+(define-public (set-loan-interest-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (<= new-rate u2000) ERR_INVALID_AMOUNT)
+        (asserts! (>= new-rate u100) ERR_INVALID_AMOUNT)
+        (var-set loan-interest-rate new-rate)
+        (ok true)
+    )
+)
+
+(define-read-only (get-loan-application (borrower principal))
+    (map-get? loan-applications borrower)
+)
+
+(define-read-only (get-loan-info (loan-id uint))
+    (map-get? loans loan-id)
+)
+
+(define-read-only (get-borrower-loans (borrower principal))
+    (default-to (list) (map-get? borrower-loans borrower))
+)
+
+(define-read-only (get-total-owed (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data (ok (calculate-total-owed loan-id))
+        ERR_LOAN_NOT_FOUND
+    )
+)
+
+(define-read-only (get-loan-status (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data (let (
+            (is-active (get is-active loan-data))
+            (is-defaulted (get is-defaulted loan-data))
+            (issued-block (get issued-block loan-data))
+            (term-blocks (get term-blocks loan-data))
+            (due-block (+ issued-block term-blocks))
+        )
+        (if is-defaulted
+            "defaulted"
+            (if is-active
+                (if (> stacks-block-height due-block)
+                    "overdue"
+                    "active"
+                )
+                "completed"
+            )
+        ))
+        "not-found"
+    )
+)
+
+(define-read-only (get-total-loans-issued)
+    (var-get total-loans-issued)
+)
+
+(define-read-only (get-total-active-loans)
+    (var-get total-active-loans)
+)
+
+(define-read-only (get-loan-interest-rate)
+    (var-get loan-interest-rate)
+)
+
+(define-read-only (check-loan-eligibility (member principal) (requested-amount uint))
+    (match (map-get? members member)
+        member-data (let (
+            (member-contribution (get contribution member-data))
+            (max-loan-amount (/ (* member-contribution u300) u100))
+            (is-active (get is-active member-data))
+            (has-pending-application (is-some (map-get? loan-applications member)))
+        )
+        {
+            eligible: (and is-active 
+                          (not has-pending-application)
+                          (<= requested-amount max-loan-amount)
+                          (> requested-amount u0)),
+            max-amount: max-loan-amount,
+            current-contribution: member-contribution
+        })
+        {
+            eligible: false,
+            max-amount: u0,
+            current-contribution: u0
+        }
     )
 )
